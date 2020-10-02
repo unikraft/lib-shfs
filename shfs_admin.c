@@ -47,10 +47,13 @@
 #include <mhash.h>
 
 #include "shfs_admin.h"
-#include "shfs_btable.h"
 #include "shfs_alloc.h"
-#include "http_parser.h"
-#include "shfs_check.h"
+#include <shfs/shfs_btable.h>
+#include <shfs/shfs_check.h>
+
+#if CONFIG_SHFS_LINKS
+#include <http_parser.h>
+#endif
 
 #ifndef INET_ADDRLEN
 #define INET_ADDRLEN 4
@@ -68,7 +71,11 @@ static struct vol_info shfs_vol;
 /******************************************************************************
  * ARGUMENT PARSING                                                           *
  ******************************************************************************/
-const char *short_opts = "h?vVfa:u:r:c:d:Cm:n:t:D:li";
+const char *short_opts = "h?vVfa:"
+#if CONFIG_SHFS_LINKS
+			 "u:t:"
+#endif
+			 "r:c:d:Cm:n:D:li";
 
 static struct option long_opts[] = {
 	{"help",		no_argument,		NULL,	'h'},
@@ -76,7 +83,10 @@ static struct option long_opts[] = {
 	{"verbose",		no_argument,		NULL,	'v'},
 	{"force",		no_argument,		NULL,	'f'},
 	{"add-obj",		required_argument,	NULL,	'a'},
+#if CONFIG_SHFS_LINKS
 	{"add-lnk",		required_argument,	NULL,	'u'},
+	{"type",		required_argument,	NULL,	't'},
+#endif
 	{"rm-obj",		required_argument,	NULL,	'r'},
 	{"cat-obj",		required_argument,	NULL,	'c'},
 	{"set-default",		required_argument,	NULL,	'd'},
@@ -84,7 +94,6 @@ static struct option long_opts[] = {
 	{"mime",		required_argument,	NULL,	'm'},
 	{"name",		required_argument,	NULL,	'n'},
 	{"digest",		required_argument,	NULL,	'D'},
-	{"type",		required_argument,	NULL,	't'},
 	{"ls",			no_argument,            NULL,	'l'},
 	{"info",		no_argument,            NULL,	'i'},
 	{NULL, 0, NULL, 0} /* end of list */
@@ -107,7 +116,9 @@ static void print_usage(char *argv0)
 	printf("  -v, --verbose                increases verbosity level (max. %d times)\n", D_MAX);
 	printf("  -f, --force                  suppresses warnings and user questions\n");
 	printf("  -a, --add-obj [FILE]         adds FILE as object to the volume\n");
+#if CONFIG_SHFS_LINKS
 	printf("  -u, --add-lnk [URL]          adds URL as remote link to the volume\n");
+#endif
 	printf("  For each add-obj, add-lnk token:\n");
 	printf("    -n, --name [NAME]          sets an additional name for the object\n");
 	printf("    -D, --digest [HASH]        sets the HASH digest for the object\n");
@@ -116,9 +127,11 @@ static void print_usage(char *argv0)
 	printf("  For each add-obj token:\n");
 	printf("    -m, --mime [MIME]          sets the MIME type for the object\n");
 	//printf("    -e, --encoding [ENCODING]  sets encoding type for preencoded content\n");
+#if CONFIG_SHFS_LINKS
 	printf("  For each add-lnk token:\n");
 	printf("    -t, --type [TYPE]          sets the TYPE for a linked object\n");
 	printf("                               TYPE can be: redirect, raw, auto\n");
+#endif
 	printf("  -r, --rm-obj [HASH]          removes an object from the volume\n");
 	printf("  -c, --cat-obj [HASH]         exports an object to stdout\n");
 	printf("  -d, --set-default [HASH]     sets the object with HASH as default\n");
@@ -247,12 +260,14 @@ static int parse_args(int argc, char **argv, struct args *args)
 			if (parse_args_setval_str(&ctoken->path, optarg) < 0)
 				die();
 			break;
+#if CONFIG_SHFS_LINKS
 		case 'u': /* add-lnk */
 			ctoken = args_add_token(ctoken, args);
 			ctoken->action = ADDLNK;
 			if (parse_args_setval_str(&ctoken->path, optarg) < 0)
 				die();
 			break;
+#endif
 		case 'm': /* mime */
 			if (!ctoken || (ctoken->action != ADDOBJ)) {
 				eprintf("Please set mime after an add-obj token\n");
@@ -277,6 +292,7 @@ static int parse_args(int argc, char **argv, struct args *args)
 			if (parse_args_setval_str(&ctoken->optstr2, optarg) < 0)
 				die();
 			break;
+#if CONFIG_SHFS_LINKS
 		case 't': /* type */
 			if (!ctoken || (ctoken->action != ADDLNK)) {
 				eprintf("Please set type after an add-lnk token\n");
@@ -287,6 +303,7 @@ static int parse_args(int argc, char **argv, struct args *args)
 				return -EINVAL;
 			}
 			break;
+#endif
 		case 'r': /* rm-obj */
 			ctoken = args_add_token(ctoken, args);
 			ctoken->action = RMOBJ;
@@ -1068,6 +1085,7 @@ static inline int hntoshfshost(const char *hn, size_t hn_len, uint8_t type, stru
 	return EINVAL;
 }
 
+#if CONFIG_SHFS_LINKS
 static int actn_addlink(struct token *j)
 {
 	struct shfs_bentry *bentry;
@@ -1230,6 +1248,7 @@ static int actn_addlink(struct token *j)
  err:
 	return ret;
 }
+#endif /* CONFIG_SHFS_LINKS */
 
 static int actn_rmfile(struct token *token)
 {
@@ -1607,10 +1626,12 @@ int main(int argc, char **argv)
 			dprintf(D_L0, "*** Token %u: add-obj\n", i);
 			ret = actn_addfile(ctoken);
 			break;
+#if CONFIG_SHFS_LINKS
 		case ADDLNK:
 			dprintf(D_L0, "*** Token %u: add-lnk\n", i);
 			ret = actn_addlink(ctoken);
 			break;
+#endif
 		case RMOBJ:
 			dprintf(D_L0, "*** Token %u: rm-obj\n", i);
 			ret = actn_rmfile(ctoken);

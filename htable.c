@@ -57,7 +57,7 @@
 #define MIN_ALIGN ((size_t) 8)
 #endif
 
-#include "htable.h"
+#include <shfs/htable.h>
 
 #ifndef max
 #define max(a, b) \

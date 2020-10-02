@@ -40,8 +40,8 @@
 #include <linux/types.h>
 #endif
 
-#include "shfs_check.h"
-#include "shfs_defs.h"
+#include <shfs/shfs_check.h>
+#include <shfs/shfs_defs.h>
 
 int shfs_detect_hdr0(void *chk0) {
 	struct shfs_hdr_common *hdr_common;
