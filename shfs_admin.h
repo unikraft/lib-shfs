@@ -35,7 +35,7 @@
 #define _SHFS_ADMIN_
 
 #include "tools_common.h"
-#include "shfs_defs.h"
+#include <shfs/shfs_defs.h>
 
 #define STR_VERSION "Simple Hash FS (SHFS) Tools: Admin"
 

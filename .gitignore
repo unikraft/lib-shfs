@@ -1,0 +1,29 @@
+*.depend
+*.o
+*.a
+*.d
+*.so
+*.orig
+*.rej
+*.bak
+*.swp
+*~
+,*
+\#*\#
+.\#*
+\#_*\#
+.\#_*
+!.gitignore
+.*
+tools/shfs_admin
+tools/shfs_mkfs
+
+# gnu global files
+GPATH
+GRTAGS
+GSYMS
+GTAGS
+
+# cscope files
+cscope.*
+ncscope.*

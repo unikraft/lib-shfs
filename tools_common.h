@@ -43,7 +43,7 @@
 #include <time.h>
 #include <inttypes.h>
 
-#include "shfs_defs.h"
+#include <shfs/shfs_defs.h>
 
 /*
  * Print helpers

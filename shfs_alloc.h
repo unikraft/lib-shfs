@@ -34,7 +34,7 @@
 #ifndef _SHFS_ALLOC_
 #define _SHFS_ALLOC_
 
-#include "shfs_defs.h"
+#include <shfs/shfs_defs.h>
 
 struct shfs_aentry {
 	chk_t start;
