@@ -1476,11 +1476,11 @@ static int actn_ls(struct token *token)
 			((uint8_t *) shfs_vol.htable_chunk_cache[bentry->hentry_htchunk]
 			 + bentry->hentry_htoffset);
 		hash_unparse(*el->h, shfs_vol.hlen, str_hash);
-		strncpy(str_name, hentry->name, sizeof(hentry->name));
+		strncpy(str_name, hentry->name, sizeof(str_name));
 		strftimestamp_s(str_date, sizeof(str_date),
 		                "%b %e, %g %H:%M", hentry->ts_creation);
 		if (!SHFS_HENTRY_ISLINK(hentry))
-			strncpy(str_mime, hentry->f_attr.mime, sizeof(hentry->f_attr.mime));
+			strncpy(str_mime, hentry->f_attr.mime, sizeof(str_mime));
 
 		/* hash */
 		if (shfs_vol.hlen <= 32)
