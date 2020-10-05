@@ -305,7 +305,7 @@ static inline void shfshost_copy(struct shfs_host *dst, const struct shfs_host *
 
 	switch(src->type) {
 	case SHFS_HOST_TYPE_NAME:
-		strncpy(dst->name, src->name, sizeof(src->name));
+		strncpy(dst->name, src->name, sizeof(dst->name));
 		break;
 
 	case SHFS_HOST_TYPE_IPV4:

@@ -39,8 +39,8 @@ RM = rm -f
 CC = gcc
 LD = gcc
 CINCLUDES += -I../include
-CFLAGS += -O3 -g -Wunused -Wtype-limits -D__SHFS_TOOLS__
-LDFLAGS +=
+CFLAGS += -O3 -Wall -D__SHFS_TOOLS__ -fdata-sections -ffunction-sections -flto
+LDFLAGS += -Wl,--gc-sections $(CFLAGS)
 LDLIBS += -luuid -lmhash
 
 default: all
