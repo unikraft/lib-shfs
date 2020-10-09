@@ -865,10 +865,14 @@ static int actn_addfile(struct token *j)
 			goto err_free_tmp_chk;
 		}
 		for (c = 0; c < csize; c++) {
-			if (c == (csize - 1))
+			if (c == (csize - 1)) {
+				/* last chunk of file */
 				rlen = fsize % shfs_vol.chunksize;
-			else
+				if (!rlen && fsize)
+					rlen = shfs_vol.chunksize;
+			} else {
 				rlen = shfs_vol.chunksize;
+			}
 
 			ret = read(fd, tmp_chk, rlen);
 			if (ret < 0) {
