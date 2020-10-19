@@ -9,3 +9,4 @@ LIBSHFS_SRCS-y += $(LIBSHFS_BASE)/shfs_fio.c
 LIBSHFS_SRCS-y += $(LIBSHFS_BASE)/shfs_cache.c
 LIBSHFS_SHFS_CACHE_FLAGS += -Wno-builtin-declaration-mismatch
 LIBSHFS_SRCS-y += $(LIBSHFS_BASE)/htable.c
+LIBSHFS_SRCS-$(CONFIG_LIBSHFS_AUTOMOUNT) += $(LIBSHFS_BASE)/automount.c
