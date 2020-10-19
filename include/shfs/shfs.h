@@ -119,11 +119,9 @@ extern struct uk_semaphore shfs_mount_lock;
 extern int shfs_mounted;
 extern unsigned int shfs_nb_open;
 
-int init_shfs(void);
 int mount_shfs(const unsigned int bd_id[], unsigned int count);
 int remount_shfs(void);
 int umount_shfs(int force);
-void exit_shfs(void);
 
 #define shfs_blkdevs_count() \
 	((shfs_mounted) ? shfs_vol.nb_members : 0)
