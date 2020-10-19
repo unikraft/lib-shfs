@@ -39,10 +39,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#if !(defined __KERNEL__) && !(defined __Unikraft__)
 #include <time.h>
+#endif
 #include <inttypes.h>
 #endif
-#include "hash.h"
+#include <shfs/hash.h>
 
 #ifdef __SHFS_TOOLS__
 #include <uuid/uuid.h>
@@ -321,7 +323,7 @@ static inline void shfshost_copy(struct shfs_host *dst, const struct shfs_host *
 	}
 }
 
-#ifndef __KERNEL__
+#if !(defined __KERNEL__) && !(defined __Unikraft__)
 static inline uint64_t gettimestamp_s(void)
 {
 	struct timeval now;
