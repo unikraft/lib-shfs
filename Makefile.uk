@@ -1,0 +1,4 @@
+$(eval $(call addlib_s,libshfs,$(CONFIG_LIBSHFS)))
+
+CINCLUDES-$(CONFIG_LIBSHFS)	+= -I$(LIBSHFS_BASE)/include
+CXXINCLUDES-$(CONFIG_LIBSHFS)	+= -I$(LIBSHFS_BASE)/include
