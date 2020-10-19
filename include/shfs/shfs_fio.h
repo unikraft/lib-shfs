@@ -34,13 +34,14 @@
 #ifndef _SHFS_FIO_
 #define _SHFS_FIO_
 
-#include "shfs_defs.h"
-#include "shfs.h"
-#include "shfs_btable.h"
+#include <shfs/shfs_defs.h>
+#include <shfs/shfs.h>
+#include <shfs/shfs_btable.h>
+#include <uk/alloc.h>
 
 #ifndef __KERNEL__
-#include "shfs_cache.h"
-#include "likely.h"
+#include <shfs/shfs_cache.h>
+#include <shfs/likely.h>
 
 #define SHFS_HASH_INDICATOR_PREFIX '?' /* has to be the same as HTTPURL_ARGS_INDICATOR_PREFIX in http.c */
 
