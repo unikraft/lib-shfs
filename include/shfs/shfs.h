@@ -34,31 +34,27 @@
 #ifndef _SHFS_H_
 #define _SHFS_H_
 
-#include <target/sys.h>
 #ifndef __KERNEL__
+#include <uk/config.h>
 #include <stdint.h>
-#include "likely.h"
-#include "mempool.h"
+#include <shfs/likely.h>
+#include <uk/alloc.h>
+#include <uk/allocpool.h>
+#include <uk/blkdev.h>
+#include <uk/semaphore.h>
+#include <uk/assert.h>
+#if CONFIG_LIBUKSCHED
+#include <uk/wait.h>
+#endif /* CONFIG_LIBUKSCHED */
 #else
 #include <asm-generic/fcntl.h>
 #include <target/stubs.h>
 #include <target/linux_shfs.h>
 #endif
-#include <target/blkdev.h>
 
 #include "shfs_defs.h"
 #ifdef SHFS_STATS
 #include "shfs_stats_data.h"
-#endif
-
-#if defined __MINIOS__ && !defined CONFIG_ARM && !defined DEBUG_BUILD
-#include <rte_memcpy.h>
-#define shfs_memcpy(dst, src, len) \
-  rte_memcpy((dst), (src), (len))
-#warning "rte_memcpy is used for SHFS"
-#else
-#define shfs_memcpy(dst, src, len) \
-  memcpy((dst), (src), (len))
 #endif
 
 #ifndef __KERNEL__
@@ -66,6 +62,7 @@
 #else
 #define MAX_NB_TRY_BLKDEVS 1
 #endif
+#define MAX_REQUESTS 1000 /* should be derived from underlying block devices */
 #define NB_AIOTOKEN 750 /* should be at least MAX_REQUESTS */
 
 #define LINUX_FIRST_INO_N 10
@@ -73,9 +70,9 @@
 struct shfs_cache;
 
 struct vol_member {
-	struct blkdev *bd;
+	struct uk_blkdev *bd;
 	uuid_t uuid;
-	sector_t sfactor;
+	__sector sfactor;
 };
 
 struct vol_info {
@@ -108,7 +105,8 @@ struct vol_info {
 
 	struct shfs_bentry *def_bentry;
 
-	struct mempool *aiotoken_pool; /* token for async I/O */
+	size_t aiotoken_len;
+	struct uk_allocpool *aiotoken_pool; /* token for async I/O */
 	struct shfs_cache *chunkcache; /* chunkcache */
 
 #ifdef SHFS_STATS
@@ -117,12 +115,12 @@ struct vol_info {
 };
 
 extern struct vol_info shfs_vol;
-extern sem_t shfs_mount_lock;
+extern struct uk_semaphore shfs_mount_lock;
 extern int shfs_mounted;
 extern unsigned int shfs_nb_open;
 
 int init_shfs(void);
-int mount_shfs(blkdev_id_t bd_id[], unsigned int count);
+int mount_shfs(const unsigned int bd_id[], unsigned int count);
 int remount_shfs(void);
 int umount_shfs(int force);
 void exit_shfs(void);
@@ -134,8 +132,12 @@ static inline void shfs_poll_blkdevs(void) {
 	register unsigned int i;
 	register uint8_t m = shfs_blkdevs_count();
 
+	/*
+	 * NOTE: We set up our blkdevs only with 1 queue,
+	 *       so we poll just that one
+	 */
 	for(i = 0; i < m; ++i)
-		blkdev_poll_req(shfs_vol.member[i].bd);
+		uk_blkdev_queue_finish_reqs(shfs_vol.member[i].bd, 0);
 }
 
 #ifdef CAN_POLL_BLKDEV
@@ -172,17 +174,19 @@ struct _shfs_aio_token;
 typedef struct _shfs_aio_token SHFS_AIO_TOKEN;
 typedef void (shfs_aiocb_t)(SHFS_AIO_TOKEN *t, void *cookie, void *argp);
 struct _shfs_aio_token {
-	/** this struct has only private data **/
-	struct mempool_obj *p_obj;
-	uint64_t infly;
+	/* token chains (used by shfs_cache) */
+	struct _shfs_aio_token *_prev;
+	struct _shfs_aio_token *_next;
+
+	unsigned int nb_members;
+	unsigned int infly;
 	int ret;
 
 	shfs_aiocb_t *cb;
 	void *cb_cookie;
 	void *cb_argp;
 
-	struct _shfs_aio_token *_prev; /* token chains (used by shfs_cache) */
-	struct _shfs_aio_token *_next;
+	struct uk_blkreq req[];
 };
 
 /*
@@ -201,38 +205,41 @@ SHFS_AIO_TOKEN *shfs_aio_chunk(chk_t start, chk_t len, int write, void *buffer,
 #define shfs_awrite_chunk(start, len, buffer, cb, cb_cookie, cb_argp) \
 	shfs_aio_chunk((start), (len), 1, (buffer), (cb), (cb_cookie), (cb_argp))
 
-static inline void shfs_aio_submit(void) {
-#ifndef __KERNEL__
-	register unsigned int i;
-	register uint8_t m = shfs_blkdevs_count();
-
-	for(i = 0; i < m; ++i)
-		blkdev_async_io_submit(shfs_vol.member[i].bd);
-#endif
-}
-
+/* TODO: Currently unsupported by ukblkdev */
 static inline void shfs_aio_wait_slot(void) {
+/*
 	register unsigned int i;
 	register uint8_t m = shfs_blkdevs_count();
 
 	for(i = 0; i < m; ++i)
 		blkdev_async_io_wait_slot(shfs_vol.member[i].bd);
+*/
+#if CONFIG_LIBUKSCHED
+	uk_sched_yield();
+#endif
 }
 
 /*
  * Internal AIO token management (do not use this functions directly!)
  */
 #ifndef __KERNEL__
-static inline SHFS_AIO_TOKEN *shfs_aio_pick_token(void)
-{
-	struct mempool_obj *t_obj;
-	t_obj = mempool_pick(shfs_vol.aiotoken_pool);
-	if (!t_obj)
-		return NULL;
-	return (SHFS_AIO_TOKEN *) t_obj->data;
-}
+SHFS_AIO_TOKEN *shfs_aio_pick_token(void);
+
 #define shfs_aio_put_token(t) \
-	mempool_put(t->p_obj)
+	uk_allocpool_return(shfs_vol.aiotoken_pool, t)
+
+static inline void shfs_aio_setup_token_mio(SHFS_AIO_TOKEN *t,
+					    unsigned int member,
+					    __sector start, __sector len,
+					    void *buf)
+{
+	UK_ASSERT(t);
+	UK_ASSERT(member < t->nb_members);
+
+	t->req[member].start_sector = start;
+	t->req[member].nb_sectors = len;
+	t->req[member].aio_buf = buf;
+}
 #else
 static inline SHFS_AIO_TOKEN *shfs_aio_pick_token(void)
 {
@@ -254,17 +261,21 @@ static inline SHFS_AIO_TOKEN *shfs_aio_pick_token(void)
  * SHFS volume mounted
  */
 #ifndef __KERNEL__
-#define shfs_aio_wait(t) \
-	while (!shfs_aio_is_done((t))) { \
-		shfs_poll_blkdevs(); \
-		if (!shfs_aio_is_done((t)))	\
-			schedule();	     \
-	}
-
 #define shfs_aio_wait_nosched(t) \
 	while (!shfs_aio_is_done((t))) { \
 		shfs_poll_blkdevs(); \
 	}
+
+#if CONFIG_LIBUKSCHED
+#define shfs_aio_wait(t)		 \
+	while (!shfs_aio_is_done((t))) { \
+		shfs_poll_blkdevs(); \
+		if (!shfs_aio_is_done((t)))	\
+			uk_sched_yield();	\
+	}
+#else
+#define shfs_aio_wait(t) shfs_aio_wait_nosched(t)
+#endif /* CONFIG_LIBUKSCHED */
 #else
 /* Plan is to use shfs_aio_chunk only to read initial metadata. So it
  * is not critical to do only synchronous reads
@@ -286,7 +297,7 @@ static inline int shfs_aio_finalize(SHFS_AIO_TOKEN *t)
 {
 	int ret;
 
-	BUG_ON(t->infly != 0);
+	UK_ASSERT(!t->infly);
 	ret = t->ret;
 	shfs_aio_put_token(t);
 
@@ -302,8 +313,8 @@ static inline int shfs_io_chunk(chk_t start, chk_t len, int write, void *buffer)
 
  retry:
 	t = shfs_aio_chunk(start, len, write, buffer, NULL, NULL, NULL);
-	shfs_aio_submit();
 	if (unlikely(!t && errno == EBUSY)) {
+		shfs_poll_blkdevs();
 		shfs_aio_wait_slot(); /* yield CPU */
 		goto retry;
 	}
@@ -323,7 +334,6 @@ static inline int shfs_io_chunk_nosched(chk_t start, chk_t len, int write, void 
 
  retry:
 	t = shfs_aio_chunk(start, len, write, buffer, NULL, NULL, NULL);
-	shfs_aio_submit();
 	if (unlikely(!t && errno == EBUSY))
 		goto retry;
 	if (unlikely(!t))
