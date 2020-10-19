@@ -56,6 +56,7 @@ int shfs_errno;
 #include <uk/blkdev.h>
 #include <uk/semaphore.h>
 #include <uk/allocpool.h>
+#include <uk/ctors.h>
 #if CONFIG_LIBUKBLKDEV_DISPATCHERTHREADS
 #include <uk/sched.h>
 #endif
@@ -82,14 +83,10 @@ unsigned int shfs_nb_open = 0;
 struct uk_semaphore shfs_mount_lock;
 struct vol_info shfs_vol;
 
-int init_shfs(void) {
+static void _shfs_ctor(void) {
 	uk_semaphore_init(&shfs_mount_lock, 1);
-	return 0;
 }
-
-void exit_shfs(void) {
-	UK_ASSERT(!shfs_mounted);
-}
+UK_CTOR(_shfs_ctor);
 
 /*
  * Block device configuration
