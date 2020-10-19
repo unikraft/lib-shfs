@@ -90,8 +90,6 @@
 #endif /* __MINIOS__ &6 HAVE_LIBC */
 
 struct shfs_cache_entry {
-	struct uk_allocpool *pool;
-
 	chk_t addr;
 	uint32_t refcount;
 
