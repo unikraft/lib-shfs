@@ -36,29 +36,29 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <target/sys.h>
-
 #ifndef __KERNEL__
 #include <stdint.h>
 #include <errno.h>
-#include "shfs_cache.h"
+#include <shfs/shfs_cache.h>
 #else
 int shfs_errno;
 #endif
 
-#include "shfs.h"
-#include "shfs_check.h"
-#include "shfs_defs.h"
-#include "shfs_btable.h"
+#include <shfs/shfs.h>
+#include <shfs/shfs_check.h>
+#include <shfs/shfs_defs.h>
+#include <shfs/shfs_btable.h>
 #ifdef SHFS_STATS
-#include "shfs_stats_data.h"
-#include "shfs_stats.h"
+#include <shfs/shfs_stats_data.h>
+#include <shfs/shfs_stats.h>
 #endif
-
-#ifdef SHFS_DEBUG
-#define ENABLE_DEBUG
+#include <uk/print.h>
+#include <uk/blkdev.h>
+#include <uk/semaphore.h>
+#include <uk/allocpool.h>
+#if CONFIG_LIBUKBLKDEV_DISPATCHERTHREADS
+#include <uk/sched.h>
 #endif
-#include "debug.h"
 
 #ifndef CACHELINE_SIZE
 #define CACHELINE_SIZE 64
@@ -79,90 +79,183 @@ TT_DECLARE(shfs_tt_vbdopen);
 
 int shfs_mounted = 0;
 unsigned int shfs_nb_open = 0;
-sem_t shfs_mount_lock;
+struct uk_semaphore shfs_mount_lock;
 struct vol_info shfs_vol;
 
 int init_shfs(void) {
-	init_SEMAPHORE(&shfs_mount_lock, 1);
+	uk_semaphore_init(&shfs_mount_lock, 1);
 	return 0;
 }
 
 void exit_shfs(void) {
-	BUG_ON(shfs_mounted);
+	UK_ASSERT(!shfs_mounted);
 }
 
+/*
+ * Block device configuration
+ */
+static const struct uk_blkdev_conf shfs_blkdev_conf = {
+	.nb_queues = 1,
+};
+
+static void _blkdev_queue_event(struct uk_blkdev *bd, uint16_t qid,
+				void *cookie __unused)
+{
+	unsigned int bd_id = uk_blkdev_id_get(bd);
+	int ret;
+
+	uk_pr_debug("bd%u-q%"PRIu16": Received event, processing queue...\n", bd_id, qid);
+
+	ret = uk_blkdev_queue_finish_reqs(bd, qid);
+	if (unlikely(ret < 0)) {
+		uk_pr_err("bd%u-q%"PRIu16": Error while processing responses: %d\n",
+			  bd_id, qid, ret);
+	}
+}
 
 /**
  * This function tries to open a blkdev and checks if it has a valid SHFS label
- * On success, it returns the opened blkdev descriptor and the read disk chk0
+ * On success, it returns the given blkdev descriptor and the read disk chk0
  *  on *chk0
  * On errors, a null pointer is returned
  *
  * Note: chk0 has to be a buffer of 4096 bytes and be aligned to 4096 bytes
  */
-static struct blkdev *shfs_checkopen_blkdev(blkdev_id_t bd_id, void *chk0, int mode)
+static struct uk_blkdev *shfs_checkopen_blkdev(unsigned int bd_id, void *chk0)
 {
-	struct blkdev *bd;
-#ifdef SHFS_DEBUG
-	char str_id[64];
-#endif
-	sector_t rlen;
+	struct uk_blkdev *bd;
+	struct uk_blkdev_queue_conf q0conf;
+	__sector rlen;
 	int ret;
 	TT_DECLARE(_tt_vbdopen);
 
-#ifdef SHFS_DEBUG
-	blkdev_id_unparse(bd_id, str_id, sizeof(str_id));
-#endif
 	TT_START(_tt_vbdopen);
-	bd = open_blkdev(bd_id, mode);
+	bd = uk_blkdev_get(bd_id);
 	TT_END(_tt_vbdopen);
 #if defined TRACE_BOOTTIME && CONFIG_AUTOMOUNT
 	shfs_tt_vbdopen += _tt_vbdopen;
 #endif
 	if (!bd) {
-		printd("Could not open %s: %s\n", str_id, strerror(errno));
+		uk_pr_debug("Could not find block device %u: %s\n",
+			    bd_id, strerror(errno));
+		goto err_out;
+	}
+	if (uk_blkdev_state_get(bd) != UK_BLKDEV_UNCONFIGURED) {
+		uk_pr_debug("Block device %u is not in unconfigured state\n",
+			    bd_id);
 		goto err_out;
 	}
 
-	if (blkdev_ssize(bd) > 4096 || blkdev_ssize(bd) < 512 ||
-	    !POWER_OF_2(blkdev_ssize(bd))) {
-		/* incompatible device */
-		printd("Incompatible block size on block device %s\n", str_id);
-		goto err_close_bd;
+	uk_pr_debug("bd%u: Configuring device (%p)...\n", bd_id, bd);
+	ret = uk_blkdev_configure(bd, &shfs_blkdev_conf);
+	if (ret < 0) {
+		uk_pr_debug("Failed to configure block device %u: %s\n",
+			    bd_id, strerror(-ret));
+		goto err_out;
+	}
+
+	q0conf.a = uk_alloc_get_default();
+	q0conf.callback = _blkdev_queue_event;
+	q0conf.callback_cookie = NULL;
+#if CONFIG_LIBUKBLKDEV_DISPATCHERTHREADS
+	q0conf.s = uk_sched_get_default();
+#endif
+
+	uk_pr_debug("bd%u-q%u: Configure queue...\n", bd_id, 0);
+	ret = uk_blkdev_queue_configure(bd, 0,
+					0 /* device default queue length */,
+					&q0conf);
+	if (ret < 0) {
+		uk_pr_debug("Failed to configure queue 0 of block device %u: %s\n",
+			    bd_id, strerror(-ret));
+		goto err_unconfigure_bd;
+	}
+
+	uk_pr_debug("bd%u: Start device...\n", bd_id);
+	ret = uk_blkdev_start(bd);
+	if (ret < 0) {
+		uk_pr_debug("Failed to start block device %u: %s\n",
+			    bd_id, strerror(-ret));
+		goto err_unconfigure_queue;
+	}
+
+	if (uk_blkdev_ssize(bd) > 4096 || uk_blkdev_ssize(bd) < 512 ||
+	    !POWER_OF_2(uk_blkdev_ssize(bd))) {
+		uk_pr_debug("bd%u: Incompatible block size on block device\n",
+			    bd_id);
+		goto err_stop_bd;
+	}
+
+	uk_pr_debug("bd%u-q%u: Enable interrupts...\n", bd_id, 0);
+	ret = uk_blkdev_queue_intr_enable(bd, 0);
+	if (ret < 0) {
+		uk_pr_debug("bd%u-q%u: Failed to enable interrupt mode: %d\n",
+			    bd_id, 0, ret);
+		errno = -ENOTSUP;
+		goto err_stop_bd;
 	}
 
 	/* read first chunk (chunksize considered as 4K) */
-	rlen = 4096 / blkdev_ssize(bd);
-	ret = blkdev_sync_read(bd, 0, rlen, chk0); /* FIXME: Use version that does not call schedule() */
+	rlen = 4096 / uk_blkdev_ssize(bd);
+	ret = uk_blkdev_sync_read(bd, 0, 0, rlen, chk0);
 	if (ret < 0) {
-		printd("Could not read from block device %s: %d\n", str_id, ret);
+		uk_pr_debug("bd%u: Could not read from block device: %d\n",
+			    bd_id, ret);
 		errno = -ret;
-		goto err_close_bd;
+		goto err_stop_bd;
 	}
 
 	/* Try to detect the SHFS disk label */
+	uk_pr_debug("bd%u: Try reading SHFS label (chunk 0)...\n", bd_id);
 	ret = shfs_detect_hdr0(chk0);
 	if (ret < 0) {
-		printd("Invalid or unsupported SHFS label detected on block device %s: %d\n", str_id, ret);
+		uk_pr_debug("bd%u: Invalid or unsupported SHFS label detected: %d\n",
+			    bd_id, ret);
 		errno = -ret;
-		goto err_close_bd;
+		goto err_stop_bd;
 	}
 
 	return bd;
 
- err_close_bd:
-	close_blkdev(bd);
+ err_stop_bd:
+	uk_pr_debug("bd%u: Stopping device...\n", bd_id);
+	uk_blkdev_stop(bd);
+ err_unconfigure_queue:
+	uk_pr_debug("bd%u: Unconfigure queue %u...\n", bd_id, 0);
+	uk_blkdev_queue_unconfigure(bd, 0);
+ err_unconfigure_bd:
+	uk_pr_debug("bd%u: Unconfigure...\n", bd_id);
+	uk_blkdev_unconfigure(bd);
  err_out:
 	return NULL;
+}
+
+static inline void _uk_blkdev_close(struct uk_blkdev *bd)
+{
+	unsigned int bd_id = uk_blkdev_id_get(bd);
+
+	if (uk_blkdev_state_get(bd) == UK_BLKDEV_RUNNING) {
+		uk_pr_debug("bd%u: Stopping device...\n", bd_id);
+		uk_blkdev_stop(bd);
+	}
+	if (uk_blkdev_state_get(bd) == UK_BLKDEV_CONFIGURED) {
+		uk_pr_debug("bd%u-q%u: Unconfiguring queue...\n", bd_id, 0);
+		uk_blkdev_queue_unconfigure(bd, 0);
+	}
+	if (uk_blkdev_state_get(bd) != UK_BLKDEV_UNCONFIGURED) {
+		uk_pr_debug("bd%u: Unconfiguring device...\n", bd_id);
+		uk_blkdev_unconfigure(bd);
+	}
 }
 
 /**
  * This function iterates over bd_ids, tries to detect a SHFS label
  * and does the low-level setup for mounting a volume
  */
-static int load_vol_cconf(blkdev_id_t bd_id[], unsigned int count)
+static int load_vol_cconf(const unsigned int bd_id[], unsigned int count)
 {
-	struct blkdev *bd;
+	struct uk_alloc *a = uk_alloc_get_default();
+	struct uk_blkdev *bd;
 	struct vol_member detected_member[MAX_NB_TRY_BLKDEVS];
 	struct shfs_hdr_common *hdr_common;
 	unsigned int i;
@@ -170,38 +263,30 @@ static int load_vol_cconf(blkdev_id_t bd_id[], unsigned int count)
 	unsigned int nb_detected_members;
 	uint64_t min_member_size;
 	int ret = 0;
-	sector_t rlen;
+	__sector rlen;
 	void *chk0;
 	int inuse;
-#ifdef SHFS_DEBUG
-	char str_id[64];
-#endif
 
 	if (count > MAX_NB_TRY_BLKDEVS) {
 		ret = -EINVAL;
 		goto err_out;
 	}
 
-	chk0 = target_malloc(4096, 4096);
+	chk0 = uk_memalign(a, 4096, 4096);
 	if (!chk0) {
-		ret = -ENOMEM;
+		ret = -errno;
 		goto err_out;
 	}
 
 	/* Iterate over block devices and try to find those with a valid SHFS disk label */
 	nb_detected_members = 0;
 	for (i = 0; i < count; i++) {
-#ifdef SHFS_DEBUG
-		blkdev_id_unparse(bd_id[i], str_id, sizeof(str_id));
-		printd("Search for SHFS label on device %s...\n", str_id);
-#endif
-		bd = shfs_checkopen_blkdev(bd_id[i], chk0, O_RDONLY);
+		uk_pr_debug("bd%u: Search for SHFS label on device...\n", bd_id[i]);
+		bd = shfs_checkopen_blkdev(bd_id[i], chk0);
 		if (!bd) {
 			continue; /* try next device */
 		}
-#ifdef SHFS_DEBUG
-		printd("Supported SHFS label detected on %s\n", str_id);
-#endif
+		uk_pr_debug("bd%u: Supported SHFS label detected\n", bd_id[i]);
 
 		/* chk0 now contains the first chunk read from disk */
 		hdr_common = (void *)((uint8_t *) chk0 + BOOT_AREA_LENGTH);
@@ -215,12 +300,9 @@ static int load_vol_cconf(blkdev_id_t bd_id[], unsigned int count)
 	}
 
 	/* Load label from first detected member */
-#ifdef SHFS_DEBUG
-	blkdev_id_unparse(bd_id[i], str_id, sizeof(str_id));
-	printd("Load SHFS label from %s...\n", str_id);
-#endif
-	rlen = 4096 / blkdev_ssize(detected_member[0].bd);
-	ret = blkdev_sync_read(detected_member[0].bd, 0, rlen, chk0);
+	uk_pr_debug("bd%u: Load SHFS label from block device\n", bd_id[0]);
+	rlen = 4096 / uk_blkdev_ssize(detected_member[0].bd);
+	ret = uk_blkdev_sync_read(detected_member[0].bd, 0, 0, rlen, chk0);
 	if (ret < 0)
 		goto err_close_bds;
 	hdr_common = (void *)((uint8_t *) chk0 + BOOT_AREA_LENGTH);
@@ -235,7 +317,8 @@ static int load_vol_cconf(blkdev_id_t bd_id[], unsigned int count)
 #endif
 	if (shfs_vol.stripemode != SHFS_SM_COMBINED &&
 	    shfs_vol.stripemode != SHFS_SM_INDEPENDENT) {
-		printd("Stripe mode 0x%x is not supported\n", shfs_vol.stripemode);
+		uk_pr_debug("Stripe mode 0x%x is not supported\n",
+			    shfs_vol.stripemode);
 		ret = -ENOTSUP;
 		goto err_close_bds;
 	}
@@ -243,17 +326,15 @@ static int load_vol_cconf(blkdev_id_t bd_id[], unsigned int count)
 	shfs_vol.volsize = hdr_common->vol_size;
 
 	/* Find and add members to the volume */
-	printd("Searching for members of volume '%s'...\n", shfs_vol.volname);
+	uk_pr_debug("Searching for members of volume '%s'...\n",
+		    shfs_vol.volname);
 	shfs_vol.nb_members = 0;
 	for (i = 0; i < hdr_common->member_count; i++) {
 		for (m = 0; m < nb_detected_members; ++m) {
 			if (uuid_compare(hdr_common->member[i].uuid, detected_member[m].uuid) == 0) {
 				/* found device */
-#ifdef SHFS_DEBUG
-				blkdev_id_unparse(blkdev_id(detected_member[m].bd), str_id, sizeof(str_id));
-				printd(" Member %u/%"PRIu8" is block device %s\n",
-				        i + 1, hdr_common->member_count, str_id);
-#endif
+				uk_pr_debug(" Member %u/%"PRIu8" is bd%u\n",
+					    i + 1, hdr_common->member_count, bd_id[m]);
 				shfs_vol.member[shfs_vol.nb_members].bd = detected_member[m].bd;
 				uuid_copy(shfs_vol.member[shfs_vol.nb_members].uuid, detected_member[m].uuid);
 #if defined CONFIG_SELECT_POLL && defined CAN_POLL_BLKDEV
@@ -267,8 +348,8 @@ static int load_vol_cconf(blkdev_id_t bd_id[], unsigned int count)
 
 	}
 	if (shfs_vol.nb_members != hdr_common->member_count) {
-		printd("Could not find all members for volume '%s'\n",
-		        shfs_vol.volname);
+		uk_pr_debug("Could not find all members for volume '%s'\n",
+			    shfs_vol.volname);
 		ret = -ENOENT;
 		goto err_close_bds;
 	}
@@ -277,35 +358,36 @@ static int load_vol_cconf(blkdev_id_t bd_id[], unsigned int count)
 	 * also the alignment requirements for io buffers */
 	if (shfs_vol.stripesize > 32768 || shfs_vol.stripesize < 4096 ||
 	    !POWER_OF_2(shfs_vol.stripesize)) {
-		printd("Stripe size invalid on volume '%s'\n",
-		        shfs_vol.volname);
+		uk_pr_debug("Stripe size invalid on volume '%s'\n",
+			    shfs_vol.volname);
 		ret = -ENOENT;
 		goto err_close_bds;
 	}
 
 	shfs_vol.ioalign = 0;
 	for (i = 0; i < shfs_vol.nb_members; ++i) {
-		/* ioalign for all chunk buffers 
+		/* ioalign for all chunk buffers
 		 * Note: Since the chunk buffers are accessed by all devices,
 		 *       the final ioalign value has to a multiple of all
 		 *       device-dependent ioaligns */
-		if (blkdev_ioalign(shfs_vol.member[i].bd) > shfs_vol.ioalign) {
-			ASSERT(!shfs_vol.ioalign ||
-			       blkdev_ioalign(shfs_vol.member[i].bd) % shfs_vol.ioalign == 0);
-			shfs_vol.ioalign = blkdev_ioalign(shfs_vol.member[i].bd);
+		if (uk_blkdev_ioalign(shfs_vol.member[i].bd) > shfs_vol.ioalign) {
+			UK_ASSERT(!shfs_vol.ioalign ||
+				  uk_blkdev_ioalign(shfs_vol.member[i].bd) % shfs_vol.ioalign == 0);
+			shfs_vol.ioalign = uk_blkdev_ioalign(shfs_vol.member[i].bd);
 		} else {
-			ASSERT(shfs_vol.ioalign % blkdev_ioalign(shfs_vol.member[i].bd) == 0);
+			UK_ASSERT(shfs_vol.ioalign % uk_blkdev_ioalign(shfs_vol.member[i].bd) == 0);
 		}
 
 		/* device dependent 'stripe-to-sector' factor */
-		shfs_vol.member[i].sfactor = shfs_vol.stripesize / blkdev_ssize(shfs_vol.member[i].bd);
+		shfs_vol.member[i].sfactor = shfs_vol.stripesize / uk_blkdev_ssize(shfs_vol.member[i].bd);
 		if (shfs_vol.member[i].sfactor == 0) {
-			printd("Stripe size invalid on volume '%s'\n",
-			        shfs_vol.volname);
+			uk_pr_debug("Stripe size invalid on volume '%s'\n",
+				    shfs_vol.volname);
 			ret = -ENOENT;
 			goto err_close_bds;
 		}
 	}
+	uk_pr_debug(" I/O align of SHFS volume: %u B\n", shfs_vol.ioalign);
 
 	/* calculate and check volume size */
 	if (shfs_vol.stripemode == SHFS_SM_COMBINED)
@@ -313,9 +395,9 @@ static int load_vol_cconf(blkdev_id_t bd_id[], unsigned int count)
 	else /* SHFS_SM_INTERLEAVED */
 		min_member_size = ((shfs_vol.volsize + 1) / shfs_vol.nb_members) * (uint64_t) shfs_vol.stripesize;
 	for (i = 0; i < shfs_vol.nb_members; ++i) {
-		if (blkdev_size(shfs_vol.member[i].bd) < min_member_size) {
-			printd("Member %u of volume '%s' is too small\n",
-			       i, shfs_vol.volname);
+		if (uk_blkdev_size(shfs_vol.member[i].bd) < min_member_size) {
+			uk_pr_debug("Member %u of volume '%s' is too small\n",
+				    i, shfs_vol.volname);
 			ret = -ENOENT;
 			goto err_close_bds;
 		}
@@ -331,17 +413,17 @@ static int load_vol_cconf(blkdev_id_t bd_id[], unsigned int count)
 			}
 		}
 		if (!inuse)
-			close_blkdev(detected_member[m].bd);
+			_uk_blkdev_close(detected_member[m].bd);
 	}
 
-	target_free(chk0);
+	uk_free(a, chk0);
 	return 0;
 
  err_close_bds:
 	for (m = 0; m < nb_detected_members; ++m)
-		close_blkdev(detected_member[m].bd);
+		_uk_blkdev_close(detected_member[m].bd);
  err_free_chk0:
-	target_free(chk0);
+	uk_free(a, chk0);
  err_out:
 	return ret;
 }
@@ -355,20 +437,24 @@ static int load_vol_cconf(blkdev_id_t bd_id[], unsigned int count)
  */
 static int load_vol_hconf(void)
 {
+	struct uk_alloc *a = uk_alloc_get_default();
 	struct shfs_hdr_config *hdr_config;
 	void *chk1;
 	int ret;
 
-	chk1 = target_malloc(4096, shfs_vol.chunksize);
+	chk1 = uk_memalign(a, 4096, shfs_vol.chunksize);
 	if (!chk1) {
-		ret = -ENOMEM;
+		ret = -errno;
 		goto out;
 	}
 
-	printd("Loading SHFS configuration chunk...\n");
+	uk_pr_debug("'%s': Loading SHFS configuration chunk...\n", shfs_vol.volname);
 	ret = shfs_read_chunk_nosched(1, 1, chk1);
-	if (ret < 0)
+	if (ret < 0) {
+		uk_pr_err("'%s': Failed to read SHFS configuration (chunk 1): %d\n",
+			  shfs_vol.volname, ret);
 		goto out_free_chk1;
+	}
 
 	hdr_config = chk1;
 	shfs_vol.htable_ref                   = hdr_config->htable_ref;
@@ -383,13 +469,13 @@ static int load_vol_hconf(void)
 
 	/* brief configuration check */
 	if (shfs_vol.htable_len == 0) {
-		printd("Malformed SHFS configuration\n");
+		uk_pr_err("'%s': Malformed SHFS configuration (chunk 1)\n", shfs_vol.volname);
 		ret = -ENOENT;
 		goto out_free_chk1;
 	}
 
  out_free_chk1:
-	target_free(chk1);
+	uk_free(a, chk1);
  out:
 	return ret;
 }
@@ -404,15 +490,13 @@ struct _load_vol_htable_aiot {
 	int ret;
 };
 
-static void _load_vol_htable_cb(SHFS_AIO_TOKEN *t, void *cookie, void *argp)
+static void _load_vol_htable_cb(SHFS_AIO_TOKEN *t, void *cookie,
+				void *argp __unused)
 {
 	struct _load_vol_htable_aiot *aiot = (struct _load_vol_htable_aiot *) cookie;
 	register int ioret;
 
-	printd("*** AIO HTABLE CB (ret = %d / left = %"PRIu64") ***\n", aiot->ret, aiot->left - 1);
-	BUG_ON(aiot->left == 0); /* This happens most likely when more requests are
-	                          * sent to device than it can handle -> check MAX_REQUESTS 
-	                          * in blkdev.h */
+	uk_pr_debug("*** AIO HTABLE CB (ret = %d / left = %"PRIu64") ***\n", aiot->ret, aiot->left - 1);
 
 	ioret = shfs_aio_finalize(t);
 	if (unlikely(ioret < 0))
@@ -424,6 +508,7 @@ static void _load_vol_htable_cb(SHFS_AIO_TOKEN *t, void *cookie, void *argp)
 
 static int load_vol_htable(void)
 {
+	struct uk_alloc *a = uk_alloc_get_default();
 	struct _load_vol_htable_aiot aiot;
 	SHFS_AIO_TOKEN *aioret;
 	struct shfs_hentry *hentry;
@@ -433,9 +518,9 @@ static int load_vol_htable(void)
 	chk_t c;
 	int ret;
 
-	printd("Allocating chunk cache reference table (size: %lu B)...\n",
-	        sizeof(void *) * shfs_vol.htable_len);
-	shfs_vol.htable_chunk_cache = target_malloc(CACHELINE_SIZE, sizeof(void *) * shfs_vol.htable_len);
+	uk_pr_debug("Allocating chunk cache reference table (size: %lu B)...\n",
+		    sizeof(void *) * shfs_vol.htable_len);
+	shfs_vol.htable_chunk_cache = uk_memalign(a, CACHELINE_SIZE, sizeof(void *) * shfs_vol.htable_len);
 	if (!shfs_vol.htable_chunk_cache) {
 		ret = -ENOMEM;
 		goto err_out;
@@ -448,36 +533,34 @@ static int load_vol_htable(void)
 	aiot.ret = 0;
 	for (c = 0; c < shfs_vol.htable_len; ++c) {
 		/* allocate buffer and register it to htable chunk cache */
-		printd("Allocate buffer for chunk %"PRIchk" of htable (size: %lu B, align: %"PRIu32")\n",
-		        c, shfs_vol.chunksize, shfs_vol.ioalign);
-		chk_buf = target_malloc(shfs_vol.ioalign, shfs_vol.chunksize);
+		uk_pr_debug("Allocate buffer for chunk %"PRIchk" of htable (size: %"PRIu32" B, align: %"PRIu32")\n",
+			    c, shfs_vol.chunksize, shfs_vol.ioalign);
+		chk_buf = uk_memalign(a, shfs_vol.ioalign, shfs_vol.chunksize);
 		if (!chk_buf) {
-			printd("Could not alloc chunk %"PRIchk"\n", c);
+			uk_pr_debug("Could not alloc chunk %"PRIchk"\n", c);
 			ret = -ENOMEM;
 			goto err_free_chunkcache;
 		}
 		shfs_vol.htable_chunk_cache[c] = chk_buf;
 
 	repeat_aio:
-		printd("Setup async read for chunk %"PRIchk"\n", c);
+		uk_pr_debug("Setup async read for chunk %"PRIchk"\n", c);
 		aioret = shfs_aread_chunk(shfs_vol.htable_ref + c, 1, chk_buf,
 		                          _load_vol_htable_cb, &aiot, NULL);
 		if (!aioret && (errno == EAGAIN || errno == EBUSY)) {
-			printd("Device is busy: Retrying...\n");
-			shfs_aio_submit();
+			uk_pr_debug("Device is busy: Retrying...\n");
 			shfs_poll_blkdevs();
 			goto repeat_aio;
 		}
 		if (!aioret) {
-			printd("Could not setup async read: %s\n", strerror(errno));
+			uk_pr_debug("Could not setup async read: %s\n", strerror(errno));
 			aiot.left -= (shfs_vol.htable_len - c);
 			goto err_cancel_aio;
 		}
 	}
-	shfs_aio_submit();
 
 	/* allocate bucket table */
-	printd("Allocating btable...\n");
+	uk_pr_debug("Allocating btable...\n");
 	shfs_vol.bt = shfs_alloc_btable(shfs_vol.htable_nb_buckets,
 	                                shfs_vol.htable_nb_entries_per_bucket,
 	                                shfs_vol.hlen);
@@ -487,11 +570,11 @@ static int load_vol_htable(void)
 	}
 
 	/* wait for I/O completion */
-	printd("Waiting for I/O completion...\n");
+	uk_pr_debug("Waiting for I/O completion...\n");
 	while (!aiot.done)
 		shfs_poll_blkdevs();
 	if (aiot.ret < 0) {
-		printd("There was an I/O error: Aborting...\n");
+		uk_pr_debug("There was an I/O error: Aborting...\n");
 		ret = -EIO;
 		goto err_free_btable;
 	}
@@ -499,7 +582,7 @@ static int load_vol_htable(void)
 	/* feed bucket table */
 	shfs_vol.def_bentry = NULL;
 
-	printd("Feeding hash table...\n");
+	uk_pr_debug("Feeding hash table...\n");
 	for (i = 0; i < shfs_vol.htable_nb_entries; ++i) {
 		c = SHFS_HTABLE_CHUNK_NO(i, shfs_vol.htable_nb_entries_per_chunk);
 		chk_buf = shfs_vol.htable_chunk_cache[c];
@@ -515,7 +598,7 @@ static int load_vol_htable(void)
 #ifdef __KERNEL__
 		bentry->ino = i + LINUX_FIRST_INO_N;
 #endif
-		init_SEMAPHORE(&bentry->updatelock, 1);
+		uk_semaphore_init(&bentry->updatelock, 1);
 #ifdef SHFS_STATS
 		memset(&bentry->hstats, 0, sizeof(bentry->hstats));
 #endif
@@ -527,7 +610,7 @@ static int load_vol_htable(void)
 
  err_cancel_aio:
 	if (aiot.left) {
-		while (!trydown(&aiot.done))
+		while (!aiot.done)
 			shfs_poll_blkdevs();
 	}
 	ret = -EIO;
@@ -538,27 +621,24 @@ static int load_vol_htable(void)
  err_free_chunkcache:
 	for (i = 0; i < shfs_vol.htable_len; ++i) {
 		if (shfs_vol.htable_chunk_cache[i])
-			target_free(shfs_vol.htable_chunk_cache[i]);
+			uk_free(a, shfs_vol.htable_chunk_cache[i]);
 	}
-	target_free(shfs_vol.htable_chunk_cache);
+	uk_free(a, shfs_vol.htable_chunk_cache);
  err_out:
 	return ret;
 }
-
-#ifndef __KERNEL__
-static void _aiotoken_pool_objinit(struct mempool_obj *, void *);
-#endif
 
 /**
  * Mount a SHFS volume
  * The volume is searched on the given list of block devices
  */
-int mount_shfs(blkdev_id_t bd_id[], unsigned int count)
+int mount_shfs(const unsigned int bd_id[], unsigned int count)
 {
+	struct uk_alloc *a = uk_alloc_get_default();
 	unsigned int i;
 	int ret;
 
-	down(&shfs_mount_lock);
+	uk_semaphore_down(&shfs_mount_lock);
 
 	if (count == 0) {
 		ret = -EINVAL;
@@ -571,20 +651,23 @@ int mount_shfs(blkdev_id_t bd_id[], unsigned int count)
 	shfs_mounted = 0;
 
 	/* load common volume information and open devices */
-	printd("Loading common volume information...\n");
+	uk_pr_debug("Loading common volume information...\n");
 	ret = load_vol_cconf(bd_id, count);
 	if (ret < 0)
 		goto err_out;
 
 	/* a memory pool required for async I/O requests (even on cache) */
-	shfs_vol.aiotoken_pool = alloc_mempool(NB_AIOTOKEN, sizeof(struct _shfs_aio_token),
-	                                       0, 0, 0, _aiotoken_pool_objinit, NULL, 0);
+	shfs_vol.aiotoken_len  = sizeof(SHFS_AIO_TOKEN)
+		+ (shfs_vol.nb_members * sizeof(struct uk_blkreq));
+	shfs_vol.aiotoken_pool = uk_allocpool_alloc(a, NB_AIOTOKEN,
+						    shfs_vol.aiotoken_len,
+						    sizeof(void *));
 	if (!shfs_vol.aiotoken_pool)
 		goto err_close_members;
 	shfs_mounted = 1; /* required by next function calls */
 
 	/* load hash conf (uses shfs_sync_read_chunk) */
-	printd("Loading volume configuration...\n");
+	uk_pr_debug("Loading volume configuration...\n");
 	ret = load_vol_hconf();
 	if (ret < 0)
 		goto err_free_aiotoken_pool;
@@ -592,24 +675,25 @@ int mount_shfs(blkdev_id_t bd_id[], unsigned int count)
 	/* load htable (uses shfs_sync_read_chunk)
 	 * This function also allocates htable_chunk_cache,
 	 * htable_chunk_cache_state and btable */
-	printd("Loading volume hash table...\n");
+	uk_pr_debug("Loading volume hash table...\n");
 	ret = load_vol_htable();
 	if (ret < 0)
 		goto err_close_members;
 
-	printd("Allocating remount chunk buffer...\n");
-	shfs_vol.remount_chunk_buffer = target_malloc(shfs_vol.ioalign, shfs_vol.chunksize);
+	uk_pr_debug("Allocating remount chunk buffer...\n");
+	shfs_vol.remount_chunk_buffer = uk_memalign(a, shfs_vol.ioalign,
+						    shfs_vol.chunksize);
 	if (!shfs_vol.remount_chunk_buffer)
 		goto err_free_htable;
 
 	/* chunk buffer cache for I/O */
-	printd("Allocating chunk cache...\n");
-	ret = shfs_alloc_cache();
+	uk_pr_debug("Allocating chunk cache...\n");
+	ret = shfs_alloc_cache(a);
 	if (ret < 0)
 		goto err_free_remount_buffer;
 
 #ifdef SHFS_STATS
-	printd("Initializing statistics...\n");
+	uk_pr_debug("Initializing statistics...\n");
 	ret = shfs_init_mstats(shfs_vol.htable_nb_buckets,
 	                       shfs_vol.htable_nb_entries_per_bucket,
 	                       shfs_vol.hlen);
@@ -620,8 +704,8 @@ int mount_shfs(blkdev_id_t bd_id[], unsigned int count)
 #endif
 
 	shfs_nb_open = 0;
-	up(&shfs_mount_lock);
-	printd("SHFS volume mounted\n");
+	uk_semaphore_up(&shfs_mount_lock);
+	uk_pr_debug("SHFS volume mounted\n");
 	return 0;
 
 	/* make compiller happy */
@@ -629,22 +713,22 @@ int mount_shfs(blkdev_id_t bd_id[], unsigned int count)
  err_free_chunkcache:
 	shfs_free_cache();
  err_free_remount_buffer:
-	target_free(shfs_vol.remount_chunk_buffer);
+	uk_free(a, shfs_vol.remount_chunk_buffer);
  err_free_htable:
 	for (i = 0; i < shfs_vol.htable_len; ++i) {
 		if (shfs_vol.htable_chunk_cache[i])
-			target_free(shfs_vol.htable_chunk_cache[i]);
+			uk_free(a, shfs_vol.htable_chunk_cache[i]);
 	}
-	target_free(shfs_vol.htable_chunk_cache);
+	uk_free(a, shfs_vol.htable_chunk_cache);
 	shfs_free_btable(shfs_vol.bt);
  err_free_aiotoken_pool:
-	free_mempool(shfs_vol.aiotoken_pool);
+	uk_allocpool_free(shfs_vol.aiotoken_pool);
  err_close_members:
 	for(i = 0; i < shfs_vol.nb_members; ++i)
-		close_blkdev(shfs_vol.member[i].bd);
+		_uk_blkdev_close(shfs_vol.member[i].bd);
 	shfs_mounted = 0;
  err_out:
-	up(&shfs_mount_lock);
+	uk_semaphore_up(&shfs_mount_lock);
 	return ret;
 }
 
@@ -655,27 +739,30 @@ int mount_shfs(blkdev_id_t bd_id[], unsigned int count)
  *  from a context that is different from the one of the main loop
  */
 int umount_shfs(int force) {
+	struct uk_alloc *a = uk_alloc_get_default();
 	unsigned int i;
 
-	down(&shfs_mount_lock);
+	uk_semaphore_down(&shfs_mount_lock);
 	if (shfs_mounted) {
 #ifndef __KERNEL__
-		if (shfs_nb_open ||
-		    mempool_free_count(shfs_vol.aiotoken_pool) < MAX_REQUESTS ||
-		    shfs_cache_ref_count()) {
+		if (shfs_nb_open
+		    || uk_allocpool_availcount(shfs_vol.aiotoken_pool)
+		    < MAX_REQUESTS
+		    || shfs_cache_ref_count()) {
 			struct htable_el *el;
 
 			/* there are still open files and/or async I/O is happening */
-			printd("Could not umount: SHFS is busy:\n");
-			printd(" Open files:               %u\n",
-			        shfs_nb_open);
-			printd(" Infly AIO tokens:         %u\n",
-			        MAX_REQUESTS - mempool_free_count(shfs_vol.aiotoken_pool));
-			printd(" Referenced chunk buffers: %"PRIu64"\n",
-			        shfs_cache_ref_count());
+			uk_pr_debug("Could not umount: SHFS is busy:\n");
+			uk_pr_debug(" Open files:               %u\n",
+				    shfs_nb_open);
+			uk_pr_debug(" Infly AIO tokens:         %u\n",
+				    MAX_REQUESTS
+				    - uk_allocpool_availcount(shfs_vol.aiotoken_pool));
+			uk_pr_debug(" Referenced chunk buffers: %"PRIu64"\n",
+				    shfs_cache_ref_count());
 
 			if (!force) {
-				up(&shfs_mount_lock);
+				uk_semaphore_up(&shfs_mount_lock);
 				return -EBUSY;
 			}
 
@@ -683,29 +770,29 @@ int umount_shfs(int force) {
 			foreach_htable_el(shfs_vol.bt, el) {
 				struct shfs_bentry *bentry = el->private;
 				bentry->update = 1; /* forbid further open() */
-				down(&bentry->updatelock); /* wait until file is closed */
+				uk_semaphore_down(&bentry->updatelock); /* wait until file is closed */
 			}
 		}
 		shfs_free_cache();
 #endif
 
 		shfs_mounted = 0;
-		target_free(shfs_vol.remount_chunk_buffer);
+		uk_free(a, shfs_vol.remount_chunk_buffer);
 		for (i = 0; i < shfs_vol.htable_len; ++i) {
 			if (shfs_vol.htable_chunk_cache[i])
-				target_free(shfs_vol.htable_chunk_cache[i]);
+				uk_free(a, shfs_vol.htable_chunk_cache[i]);
 		}
-		target_free(shfs_vol.htable_chunk_cache);
+		uk_free(a, shfs_vol.htable_chunk_cache);
 		shfs_free_btable(shfs_vol.bt);
-		free_mempool(shfs_vol.aiotoken_pool);
+		uk_allocpool_free(shfs_vol.aiotoken_pool);
 		for(i = 0; i < shfs_vol.nb_members; ++i)
-			close_blkdev(shfs_vol.member[i].bd); /* might call schedule() */
+			_uk_blkdev_close(shfs_vol.member[i].bd); /* might call schedule() */
 		shfs_vol.nb_members = 0;
 #ifdef SHFS_STATS
 		shfs_free_mstats();
 #endif
 	}
-	up(&shfs_mount_lock);
+	uk_semaphore_up(&shfs_mount_lock);
 	return 0;
 }
 
@@ -729,7 +816,7 @@ static int reload_vol_htable(void) {
 	register unsigned int e;
 	int ret = 0;
 
-	printd("Re-reading hash table...\n");
+	uk_pr_debug("Re-reading hash table...\n");
 	for (c = 0; c < shfs_vol.htable_len; ++c) {
 		/* read chunk from disk */
 		ret = shfs_read_chunk(shfs_vol.htable_ref + c, 1, nchk_buf); /* calls schedule() */
@@ -751,7 +838,7 @@ static int reload_vol_htable(void) {
 
 				if (!chash_is_zero || !nhash_is_zero) { /* process only if at least one hash
 				                                         * digest is non-zero */
-					printd("Chunk %"PRIchk", entry %u has been updated\n", c ,e);
+					uk_pr_debug("Chunk %"PRIchk", entry %u has been updated\n", c ,e);
 					/* Update hash of entry
 					 * Note: Any open file should not be affected, because
 					 *  there is no hash table lookup needed again
@@ -764,7 +851,7 @@ static int reload_vol_htable(void) {
 					          nhentry->hash);
 					/* lock entry */
 					bentry->update = 1; /* forbid further open() */
-					down(&bentry->updatelock); /* wait until files is closed */
+					uk_semaphore_down(&bentry->updatelock); /* wait until files is closed */
 
 #ifdef SHFS_STATS
 					if (!chash_is_zero) {
@@ -792,7 +879,7 @@ static int reload_vol_htable(void) {
 					shfs_flush_cache();
 
 					/* unlock entry */
-					up(&bentry->updatelock);
+					uk_semaphore_up(&bentry->updatelock);
 					bentry->update = 0;
 
 					/* update default entry reference */
@@ -816,14 +903,14 @@ static int reload_vol_htable(void) {
 
 				/* lock entry */
 				bentry->update = 1; /* forbid further open() */
-				down(&bentry->updatelock); /* wait until this file is closed */
+				uk_semaphore_down(&bentry->updatelock); /* wait until this file is closed */
 
 				memcpy(chentry, nhentry, sizeof(*chentry));
 
 				shfs_flush_cache(); /* to ensure re-reading this file */
 
 				/* unlock entry */
-				up(&bentry->updatelock);
+				uk_semaphore_up(&bentry->updatelock);
 				bentry->update = 0;
 
 				/* update default entry reference */
@@ -849,7 +936,7 @@ static int reload_vol_htable(void) {
 int remount_shfs(void) {
 	int ret;
 
-	down(&shfs_mount_lock);
+	uk_semaphore_down(&shfs_mount_lock);
 	if (!shfs_mounted) {
 		ret = -ENODEV;
 		goto out;
@@ -859,7 +946,7 @@ int remount_shfs(void) {
 
 	ret = reload_vol_htable();
  out:
-	up(&shfs_mount_lock);
+	uk_semaphore_up(&shfs_mount_lock);
 	return ret;
 }
 
@@ -870,40 +957,78 @@ int remount_shfs(void) {
  * cooperative scheduler...
  */
 #ifndef __KERNEL__
-static void _aiotoken_pool_objinit(struct mempool_obj *t_obj, void *argp)
+static void _aiotoken_pool_obj_membercb(struct uk_blkreq *req __unused,
+					void *cookie)
 {
-	SHFS_AIO_TOKEN *t;
+	SHFS_AIO_TOKEN *t = cookie;
 
-	t = t_obj->data;
-	t->p_obj = t_obj;
-	t->ret = 0;
-	t->infly = 0;
-	t->cb = NULL;
-	t->cb_argp = NULL;
-	t->cb_cookie = NULL;
-}
-#endif
+	UK_ASSERT(t);
+	UK_ASSERT(t->infly > 0);
 
-static void _shfs_aio_cb(int ret, void *argp) {
-	SHFS_AIO_TOKEN *t = argp;
-
-	if (unlikely(ret < 0))
-		t->ret = ret;
 	--t->infly;
 
 	if (t->infly == 0) {
+		/* we are the last member device that finished,
+		 * now the request is completed */
+		unsigned int i;
+
+		for (i = 0; i < t->nb_members; ++i) {
+			UK_ASSERT(uk_blkreq_is_done(&t->req[i]));
+
+			if (t->req[i].result < 0) {
+				uk_pr_debug("aio_token %p: member %u returned with I/O error %d\n",
+					    t, i, t->req[i].result);
+				t->ret = t->req[i].result;
+			}
+		}
+
 		/* call user's callback */
 		if (t->cb)
 			t->cb(t, t->cb_cookie, t->cb_argp);
 	}
 }
 
-SHFS_AIO_TOKEN *shfs_aio_chunk(chk_t start, chk_t len, int write, void *buffer,
+SHFS_AIO_TOKEN *shfs_aio_pick_token(void)
+{
+	SHFS_AIO_TOKEN *t = (SHFS_AIO_TOKEN *)
+		uk_allocpool_take(shfs_vol.aiotoken_pool);
+	unsigned int i;
+
+	UK_ASSERT(shfs_vol.nb_members > 0);
+	UK_ASSERT(uk_allocpool_objlen(shfs_vol.aiotoken_pool)
+		  >= (sizeof(SHFS_AIO_TOKEN)
+		      + (shfs_vol.nb_members * sizeof(struct uk_blkreq))));
+
+	if (!t)
+		return NULL;
+
+	t->ret = 0;
+	t->infly = 0;
+	t->nb_members = shfs_vol.nb_members;
+	t->cb = NULL;
+	t->cb_argp = NULL;
+	t->cb_cookie = NULL;
+	t->_prev = t->_next = NULL;
+
+	for (i = 0; i < shfs_vol.nb_members; ++i) {
+		/* Initialize we will set up I/O location later in shfs_aio_chunk */
+		uk_blkreq_init(&t->req[i],
+			       UK_BLKREQ_READ,
+			       0, 0, NULL,
+			       _aiotoken_pool_obj_membercb,
+			       t);
+	}
+
+	return t;
+}
+#endif
+
+SHFS_AIO_TOKEN *shfs_aio_chunk(chk_t start, chk_t len, int write __unused, void *buffer,
                                shfs_aiocb_t *cb, void *cb_cookie, void *cb_argp)
 {
 	int ret;
-	uint64_t num_req_per_member;
-	sector_t start_sec;
+	//uint64_t num_req_per_member;
+	__sector start_sec;
 	unsigned int m;
 	uint8_t *ptr = buffer;
 	SHFS_AIO_TOKEN *t;
@@ -911,6 +1036,7 @@ SHFS_AIO_TOKEN *shfs_aio_chunk(chk_t start, chk_t len, int write, void *buffer,
 	strp_t end_s;
 	strp_t strp;
 
+	UK_ASSERT(!write);
 
 	if (!shfs_mounted) {
 		errno = ENODEV;
@@ -928,19 +1054,22 @@ SHFS_AIO_TOKEN *shfs_aio_chunk(chk_t start, chk_t len, int write, void *buffer,
 		end_s = (strp_t) (start_s + len);
 		break;
 	}
-	num_req_per_member = (end_s - start_s) / shfs_vol.nb_members;
+	//num_req_per_member = (end_s - start_s) / shfs_vol.nb_members;
 
-	/* check if each member has enough request objects available for this operation */
+	/* TODO: check if each member has enough request objects available for this operation */
+	/*
 	for (m = 0; m < shfs_vol.nb_members; ++m) {
 		if (blkdev_avail_req(shfs_vol.member[m].bd) < num_req_per_member) {
 			errno = EAGAIN;
 			goto err_out;
 		}
 	}
+	*/
 
 	/* pick token */
 	t = shfs_aio_pick_token();
 	if (!t) {
+		uk_pr_debug("Out of tokens...");
 		errno = EAGAIN;
 		goto err_out;
 	}
@@ -954,20 +1083,23 @@ SHFS_AIO_TOKEN *shfs_aio_chunk(chk_t start, chk_t len, int write, void *buffer,
 		 * instead of multiplies, mods and divs */
 		m = strp % shfs_vol.nb_members;
 		start_sec = (strp / shfs_vol.nb_members) * shfs_vol.member[m].sfactor;
+		shfs_aio_setup_token_mio(t, m, start_sec, shfs_vol.member[m].sfactor, ptr);
+		++t->infly;
 
-		printd("Request: member=%u, start=%"PRIsctr"s, len=%"PRIsctr"s, dataptr=@%p\n",
-		        m, start_sec, shfs_vol.member[m].sfactor, ptr);
-		ret = blkdev_async_io(shfs_vol.member[m].bd, start_sec, shfs_vol.member[m].sfactor,
-		                      write, ptr, _shfs_aio_cb, t);
+		uk_pr_debug("Request: member=%u, start=%"__PRIsctr"s, len=%"__PRIsctr"s, dataptr=@%p\n",
+			    m, start_sec, shfs_vol.member[m].sfactor, ptr);
+		ret = uk_blkdev_queue_submit_one(shfs_vol.member[m].bd, 0,
+						 &t->req[m]);
 		if (unlikely(ret < 0)) {
 			t->cb = NULL; /* erase callback */
-			printd("Error while setting up async I/O request for member %u: %d. "
-				"Cancelling request...\n", m, ret);
+			--t->infly;
+			uk_pr_debug("Error while setting up async I/O request for member %u: %d. "
+				    "Cancelling request...\n", m, ret);
 			shfs_aio_wait(t);
-			errno = -ret;
+
+			errno = (ret == -ENOSPC) ? EAGAIN : -ret;
 			goto err_free_token;
 		}
-		++t->infly;
 		ptr += shfs_vol.stripesize;
 	}
 	return t;
