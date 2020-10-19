@@ -31,16 +31,14 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#include <target/sys.h>
-
-#include "likely.h"
-#include "shfs_fio.h"
-#include "shfs.h"
-#include "shfs_btable.h"
-#include "shfs_cache.h"
+#include <shfs/likely.h>
+#include <shfs/shfs_fio.h>
+#include <shfs/shfs.h>
+#include <shfs/shfs_btable.h>
+#include <shfs/shfs_cache.h>
 
 #ifdef SHFS_STATS
-#include "shfs_stats.h"
+#include <shfs/shfs_stats.h>
 #endif
 
 /*
@@ -63,7 +61,7 @@ static inline SHFS_FD _shfs_fio_open_bentry(struct shfs_bentry *bentry)
 
 	++shfs_nb_open;
 	if (bentry->refcount == 0) {
-		trydown(&bentry->updatelock); /* lock file for updates */
+		uk_semaphore_down_try(&bentry->updatelock); /* lock file for updates */
 		shfs_fio_clear_cookie(bentry);
 	}
 	++bentry->refcount;
@@ -195,7 +193,7 @@ void shfs_fio_close(SHFS_FD f)
 
 	--bentry->refcount;
 	if (bentry->refcount == 0) /* unlock file for updates */
-		up(&bentry->updatelock);
+		uk_semaphore_up(&bentry->updatelock);
 	--shfs_nb_open;
 }
 
@@ -251,6 +249,7 @@ void  shfs_fio_link_rpath(SHFS_FD f, char *out, size_t outlen)
  */
 int shfs_fio_read(SHFS_FD f, uint64_t offset, void *buf, uint64_t len)
 {
+	struct uk_alloc *a = uk_alloc_get_default();
 	struct shfs_bentry *bentry = (struct shfs_bentry *) f;
 	struct shfs_hentry *hentry = bentry->hentry;
 	void     *chk_buf;
@@ -270,8 +269,8 @@ int shfs_fio_read(SHFS_FD f, uint64_t offset, void *buf, uint64_t len)
 	    ((offset + len) > hentry->f_attr.len))
 		return -EINVAL;
 
-	/* pick chunk I/O buffer from pool */
-	chk_buf = target_malloc(shfs_vol.ioalign, shfs_vol.chunksize);
+	/* scratch I/O buffer */
+	chk_buf = uk_memalign(a, shfs_vol.ioalign, shfs_vol.chunksize);
 	if (!chk_buf)
 		return -ENOMEM;
 
@@ -287,9 +286,9 @@ int shfs_fio_read(SHFS_FD f, uint64_t offset, void *buf, uint64_t len)
 			goto out;
 
 		rlen = min(shfs_vol.chunksize - byt_off, left);
-		shfs_memcpy((uint8_t *) buf + buf_off,
-			    (uint8_t *) chk_buf + byt_off,
-			    rlen);
+		memcpy((uint8_t *) buf + buf_off,
+		       (uint8_t *) chk_buf + byt_off,
+		       rlen);
 		left -= rlen;
 
 		++chk_off;   /* go to next chunk */
@@ -298,12 +297,13 @@ int shfs_fio_read(SHFS_FD f, uint64_t offset, void *buf, uint64_t len)
 	}
 
  out:
-	target_free(chk_buf);
+	uk_free(a, chk_buf);
 	return ret;
 }
 
 int shfs_fio_read_nosched(SHFS_FD f, uint64_t offset, void *buf, uint64_t len)
 {
+	struct uk_alloc *a = uk_alloc_get_default();
 	struct shfs_bentry *bentry = (struct shfs_bentry *) f;
 	struct shfs_hentry *hentry = bentry->hentry;
 	void     *chk_buf;
@@ -324,7 +324,7 @@ int shfs_fio_read_nosched(SHFS_FD f, uint64_t offset, void *buf, uint64_t len)
 		return -EINVAL;
 
 	/* pick chunk I/O buffer from pool */
-	chk_buf = target_malloc(shfs_vol.ioalign, shfs_vol.chunksize);
+	chk_buf = uk_memalign(a, shfs_vol.ioalign, shfs_vol.chunksize);
 	if (!chk_buf)
 		return -ENOMEM;
 
@@ -340,9 +340,9 @@ int shfs_fio_read_nosched(SHFS_FD f, uint64_t offset, void *buf, uint64_t len)
 			goto out;
 
 		rlen = min(shfs_vol.chunksize - byt_off, left);
-		shfs_memcpy((uint8_t *) buf + buf_off,
-			    (uint8_t *) chk_buf + byt_off,
-			    rlen);
+		memcpy((uint8_t *) buf + buf_off,
+		       (uint8_t *) chk_buf + byt_off,
+		       rlen);
 		left -= rlen;
 
 		++chk_off;   /* go to next chunk */
@@ -351,7 +351,7 @@ int shfs_fio_read_nosched(SHFS_FD f, uint64_t offset, void *buf, uint64_t len)
 	}
 
  out:
-	target_free(chk_buf);
+	uk_free(a, chk_buf);
 	return ret;
 }
 
@@ -390,9 +390,9 @@ int shfs_fio_cache_read(SHFS_FD f, uint64_t offset, void *buf, uint64_t len)
 		}
 
 		rlen = min(shfs_vol.chunksize - byt_off, left);
-		shfs_memcpy((uint8_t *) buf + buf_off,
-			    (uint8_t *) cce->buffer + byt_off,
-			    rlen);
+		memcpy((uint8_t *) buf + buf_off,
+		       (uint8_t *) cce->buffer + byt_off,
+		       rlen);
 		left -= rlen;
 
 		shfs_cache_release(cce);
@@ -406,7 +406,8 @@ int shfs_fio_cache_read(SHFS_FD f, uint64_t offset, void *buf, uint64_t len)
 	return ret;
 }
 
-int shfs_fio_cache_read_nosched(SHFS_FD f, uint64_t offset, void *buf, uint64_t len)
+int shfs_fio_cache_read_nosched(SHFS_FD f, uint64_t offset, void *buf,
+				uint64_t len)
 {
 	struct shfs_bentry *bentry = (struct shfs_bentry *) f;
 	struct shfs_hentry *hentry = bentry->hentry;
@@ -441,9 +442,9 @@ int shfs_fio_cache_read_nosched(SHFS_FD f, uint64_t offset, void *buf, uint64_t 
 		}
 
 		rlen = min(shfs_vol.chunksize - byt_off, left);
-		shfs_memcpy((uint8_t *) buf + buf_off,
-			    (uint8_t *) cce->buffer + byt_off,
-			    rlen);
+		memcpy((uint8_t *) buf + buf_off,
+		       (uint8_t *) cce->buffer + byt_off,
+		       rlen);
 		left -= rlen;
 
 		shfs_cache_release(cce);

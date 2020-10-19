@@ -5,3 +5,4 @@ CXXINCLUDES-$(CONFIG_LIBSHFS)	+= -I$(LIBSHFS_BASE)/include
 
 LIBSHFS_SRCS-y += $(LIBSHFS_BASE)/shfs_check.c
 LIBSHFS_SRCS-y += $(LIBSHFS_BASE)/shfs.c
+LIBSHFS_SRCS-y += $(LIBSHFS_BASE)/shfs_fio.c
