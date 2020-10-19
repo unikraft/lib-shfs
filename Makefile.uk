@@ -2,3 +2,5 @@ $(eval $(call addlib_s,libshfs,$(CONFIG_LIBSHFS)))
 
 CINCLUDES-$(CONFIG_LIBSHFS)	+= -I$(LIBSHFS_BASE)/include
 CXXINCLUDES-$(CONFIG_LIBSHFS)	+= -I$(LIBSHFS_BASE)/include
+
+LIBSHFS_SRCS-y += $(LIBSHFS_BASE)/shfs_check.c
