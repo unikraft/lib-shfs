@@ -1,4 +1,4 @@
-config LIBSHFS
+menuconfig LIBSHFS
 	bool "libshfs: SHFS (Simple Hash Filesystem)"
 	default n
 	select LIBNOLIBC if !HAVE_LIBC
@@ -11,3 +11,14 @@ config LIBSHFS
 	select LIBUKLOCK
 	select LIBUKLOCK_MUTEX
 	select LIBUKLOCK_SEMAPHORE
+
+if LIBSHFS
+	config LIBSHFS_AUTOMOUNT
+	bool "Automatically mount an SHFS volume during boot"
+	default n
+
+	config LIBSHFS_AUTOMOUNT_TRYONLY
+	bool "Continue without volume in case of mount errors"
+	depends on LIBSHFS_AUTOMOUNT
+	default n
+endif
