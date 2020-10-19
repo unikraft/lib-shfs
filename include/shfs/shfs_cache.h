@@ -34,12 +34,18 @@
 #ifndef _SHFS_CACHE_
 #define _SHFS_CACHE_
 
-#include "shfs_cache.h"
-#include "shfs_defs.h"
-#include "shfs.h"
+#include <uk/config.h>
+#include <uk/alloc.h>
+#include <uk/allocpool.h>
+#include <shfs/shfs_cache.h>
+#include <shfs/shfs_defs.h>
+#include <shfs/shfs.h>
 
-#include "dlist.h"
-#include "mempool.h"
+#if CONFIG_LIBUKSCHED
+#include <uk/wait.h>
+#endif
+
+#include <shfs/dlist.h>
 
 #ifndef SHFS_CACHE_HTABLE_AVG_LIST_LENGTH_PER_ENTRY
 #define SHFS_CACHE_HTABLE_AVG_LIST_LENGTH_PER_ENTRY 2 /* defines in the end roughly the average maximum number of comparisons
@@ -84,7 +90,7 @@
 #endif /* __MINIOS__ &6 HAVE_LIBC */
 
 struct shfs_cache_entry {
-	struct mempool_obj *pobj;
+	struct uk_allocpool *pool;
 
 	chk_t addr;
 	uint32_t refcount;
@@ -109,7 +115,8 @@ struct shfs_cache_htel {
 };
 
 struct shfs_cache {
-	struct mempool *pool;
+	struct uk_alloc *a;
+	struct uk_allocpool *pool;
 	uint32_t htlen;
 	uint32_t htmask;
 	uint64_t nb_ref_entries;
@@ -153,7 +160,7 @@ struct shfs_cache {
   do {} while (0)
 #endif /* SHFS_CACHE_STATS */
 
-int shfs_alloc_cache(void);
+int shfs_alloc_cache(struct uk_alloc *a);
 void shfs_flush_cache(void); /* releases unreferenced buffers */
 void shfs_free_cache(void);
 #define shfs_cache_ref_count() \
@@ -219,7 +226,9 @@ static inline struct shfs_cache_entry *shfs_cache_read(chk_t addr)
 	do {
 		ret = shfs_cache_aread(addr, NULL, NULL, NULL, &cce, &t);
 		if (ret == -EAGAIN) {
-			schedule();
+#if CONFIG_LIBUKSCHED
+			uk_sched_yield();
+#endif
 			shfs_poll_blkdevs();
 		}
 	} while (ret == -EAGAIN);
