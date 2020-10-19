@@ -41,9 +41,10 @@
 #ifdef __SHFS_TOOLS__
 #include <semaphore.h>
 #include <assert.h>
-#define ASSERT assert
+#define UK_ASSERT assert
 #else
-#include <target/sys.h>
+#include <uk/assert.h>
+#include <uk/semaphore.h>
 #endif
 
 #include "shfs_defs.h"
@@ -68,7 +69,7 @@ struct shfs_bentry {
 #ifndef __SHFS_TOOLS__
 	struct shfs_hentry *hentry; /* reference to buffered entry in cache */
 	uint32_t refcount;
-	sem_t updatelock; /* lock is helt as long the file is opened */
+	struct uk_semaphore updatelock; /* lock is helt as long the file is opened */
 	int update; /* is set when a entry update is ongoing */
 
 #ifdef SHFS_STATS
@@ -150,7 +151,8 @@ static inline struct shfs_bentry *shfs_btable_addentry(struct htable *bt, hash51
 /**
  * Deletes an entry from table
  */
-static void shfs_btable_rmentry(struct htable *bt, hash512_t h) {
+static inline void shfs_btable_rmentry(struct htable *bt, hash512_t h)
+{
 	struct htable_el *el;
 
 	el = htable_lookup(bt, h);
@@ -176,7 +178,7 @@ static inline struct shfs_bentry *shfs_btable_feed(struct htable *bt, uint64_t e
 	/* TODO: Check for overflows */
 	bkt_idx = (uint32_t) (ent_idx / (uint64_t) bt->el_per_bkt);
 	el_idx_bkt = (uint32_t) (ent_idx % (uint64_t) bt->el_per_bkt);
-	ASSERT(bkt_idx < bt->nb_bkts);
+	UK_ASSERT(bkt_idx < bt->nb_bkts);
 
 	/* entry found */
 	b = bt->b[bkt_idx];
