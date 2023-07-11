@@ -1,0 +1,3 @@
+name        := "shfs"
+description := "Simon's Hash-based File System"
+license     := "BSD-3-Clause"
