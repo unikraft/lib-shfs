@@ -10,7 +10,7 @@ static const unsigned int bd_id[] = {
 	20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
 	30, 31 };
 
-static int _shfs_automount(void)
+static int _shfs_automount(struct uk_init_ctx *ictx __unused)
 {
 	int ret __maybe_unused;
 
@@ -40,4 +40,4 @@ err_out:
 #endif
 }
 
-uk_rootfs_initcall(_shfs_automount);
+uk_rootfs_initcall(_shfs_automount, 0x0);

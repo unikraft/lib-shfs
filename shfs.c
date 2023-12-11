@@ -155,7 +155,7 @@ static struct uk_blkdev *shfs_checkopen_blkdev(unsigned int bd_id, void *chk0)
 	q0conf.callback = _blkdev_queue_event;
 	q0conf.callback_cookie = NULL;
 #if CONFIG_LIBUKBLKDEV_DISPATCHERTHREADS
-	q0conf.s = uk_sched_get_default();
+	q0conf.s = uk_sched_current();
 #endif
 
 	uk_pr_debug("bd%u-q%u: Configure queue...\n", bd_id, 0);
